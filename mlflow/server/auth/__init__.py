@@ -1000,7 +1000,10 @@ class RetentionGate:
         self._default_permission = default_permission
         self._absent = absent
         self._always = always
-        self._decided: dict[tuple[str, str], bool] = {}
+        self._loaded_types = {
+            key.resource_type for key in requirements_to_grant_load_keys(templates.values())
+        }
+        self._decided: dict[Requirement, bool] = {}
         self._folded: dict[GrantLoadKey, Permission | None] = {}
 
     def retains(self, resource_type: str, resource_id: "str | None" = None) -> bool:
@@ -1010,21 +1013,27 @@ class RetentionGate:
                 f"No requirement template for {resource_type!r}. Pass one to retention_gate. "
                 f"Declared: {sorted(self._templates)}"
             )
-        if self._always is not None:
-            return self._always
         requirement = (
             template if resource_id is None else template._replace(resource_id=resource_id)
         )
-        cache_key = (requirement.resource_type, requirement.resource_id)
-        decided = self._decided.get(cache_key)
+        return self.allows(requirement)
+
+    def allows(self, requirement: Requirement) -> bool:
+        """Like ``retains``, for a requirement whose fallback keys vary by row."""
+        keys = requirement_to_grant_load_keys(requirement)
+        if missing := {key.resource_type for key in keys} - self._loaded_types:
+            raise KeyError(
+                f"No grants loaded for {sorted(missing)}. Pass a template to retention_gate."
+            )
+        if self._always is not None:
+            return self._always
+        decided = self._decided.get(requirement)
         if decided is None:
-            permissions = {
-                key: self._fold(key) for key in requirement_to_grant_load_keys(requirement)
-            }
+            permissions = {key: self._fold(key) for key in keys}
             decided = requirement_satisfied(
                 requirement, permissions, self._default_permission, self._absent
             )
-            self._decided[cache_key] = decided
+            self._decided[requirement] = decided
         return decided
 
     def _fold(self, key: GrantLoadKey) -> "Permission | None":
@@ -2904,26 +2913,27 @@ def validate_can_view_request_workspace() -> bool:
 
 
 # Scorers
-def _scorer_version_not_denied() -> bool:
-    experiment_id = _get_request_param("experiment_id")
-    name = _get_request_param("name")
-    scorer = (RESOURCE_TYPE_SCORER, store._scorer_pattern(experiment_id, name))
-    return authorize(
-        authenticate_request().username,
-        (RESOURCE_TYPE_EXPERIMENT, experiment_id),
-        [
-            Requirement(
-                RESOURCE_TYPE_SCORER_VERSION,
-                "*",
-                ACTION_NOT_DENIED,
-                fallback_if_no_grant=(scorer,),
-            )
-        ],
-    )
+def _scorer_read_requirements(experiment_id: str, scorer_pattern: str) -> "list[Requirement]":
+    # A scorer grant decides; without one, the experiment's read does, as for runs and traces.
+    experiment = (RESOURCE_TYPE_EXPERIMENT, experiment_id)
+    scorer = (RESOURCE_TYPE_SCORER, scorer_pattern)
+    return [
+        Requirement(*scorer, "read", fallback_if_no_grant=(experiment,)),
+        Requirement(*experiment, ACTION_NOT_DENIED),
+        Requirement(
+            RESOURCE_TYPE_SCORER_VERSION, "*", ACTION_NOT_DENIED, fallback_if_no_grant=(scorer,)
+        ),
+    ]
 
 
 def validate_can_read_scorer():
-    return _get_permission_from_scorer_name().can_read and _scorer_version_not_denied()
+    experiment_id = _get_request_param("experiment_id")
+    scorer_pattern = store._scorer_pattern(experiment_id, _get_request_param("name"))
+    return authorize(
+        authenticate_request().username,
+        (RESOURCE_TYPE_EXPERIMENT, experiment_id),
+        _scorer_read_requirements(experiment_id, scorer_pattern),
+    )
 
 
 def validate_can_update_scorer():
@@ -4230,7 +4240,7 @@ def _guardrail_scorer_not_denied(guardrail_id: str) -> bool:
     scorer = (RESOURCE_TYPE_SCORER, scorer_pattern)
     return authorize(
         authenticate_request().username,
-        # Anchored on the scorer's experiment, as ``_scorer_version_not_denied`` is: the anchor only
+        # Anchored on the scorer's experiment, as ``validate_can_read_scorer`` is: the anchor only
         # names the workspace whose grants apply, and cross-workspace requests are unreachable.
         (RESOURCE_TYPE_EXPERIMENT, experiment_id),
         [
@@ -6879,28 +6889,17 @@ def _scorer_row_keys(scorer) -> "tuple[str, str]":
 
 
 def _withhold_denied_guardrail_scorers(configs) -> bool:
-    workspace_fallback = ((RESOURCE_TYPE_WORKSPACE, "*"),)
     gate = retention_gate(
         authenticate_request().username,
         (RESOURCE_TYPE_WORKSPACE, "*"),
-        [
-            Requirement(RESOURCE_TYPE_SCORER_VERSION, "*", ACTION_NOT_DENIED),
-            Requirement(
-                RESOURCE_TYPE_EXPERIMENT, "*", "read", fallback_if_no_grant=workspace_fallback
-            ),
-            Requirement(RESOURCE_TYPE_SCORER, "*", "read", fallback_if_no_grant=workspace_fallback),
-        ],
+        _scorer_read_requirements("*", "*"),
     )
     withheld = False
     for config in configs:
         if not config.guardrail.HasField("scorer"):
             continue
         experiment_id, scorer_pattern = _scorer_row_keys(config.guardrail.scorer)
-        if (
-            gate.retains(RESOURCE_TYPE_SCORER_VERSION)
-            and gate.retains(RESOURCE_TYPE_EXPERIMENT, experiment_id)
-            and gate.retains(RESOURCE_TYPE_SCORER, scorer_pattern)
-        ):
+        if all(map(gate.allows, _scorer_read_requirements(experiment_id, scorer_pattern))):
             continue
         config.guardrail.ClearField("scorer")
         withheld = True
@@ -6943,26 +6942,15 @@ def filter_list_scorers(resp: Response) -> None:
     if not response_message.scorers:
         return
 
-    workspace_fallback = ((RESOURCE_TYPE_WORKSPACE, "*"),)
     gate = retention_gate(
         authenticate_request().username,
         (RESOURCE_TYPE_WORKSPACE, "*"),
-        [
-            Requirement(RESOURCE_TYPE_SCORER_VERSION, "*", ACTION_NOT_DENIED),
-            Requirement(
-                RESOURCE_TYPE_EXPERIMENT, "*", "read", fallback_if_no_grant=workspace_fallback
-            ),
-            Requirement(RESOURCE_TYPE_SCORER, "*", "read", fallback_if_no_grant=workspace_fallback),
-        ],
+        _scorer_read_requirements("*", "*"),
     )
     kept = []
     for scorer in response_message.scorers:
         experiment_id, scorer_pattern = _scorer_row_keys(scorer)
-        if (
-            gate.retains(RESOURCE_TYPE_SCORER_VERSION)
-            and gate.retains(RESOURCE_TYPE_EXPERIMENT, experiment_id)
-            and gate.retains(RESOURCE_TYPE_SCORER, scorer_pattern)
-        ):
+        if all(map(gate.allows, _scorer_read_requirements(experiment_id, scorer_pattern))):
             kept.append(scorer)
     response_message.ClearField("scorers")
     response_message.scorers.extend(kept)

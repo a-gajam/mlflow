@@ -8474,6 +8474,33 @@ def test_scorer_list_filter_honors_an_experiment_deny(workspace_permission_setup
     assert _run_scorer_list_filter(rows) == ["s2"]
 
 
+@pytest.mark.parametrize(
+    ("grants", "visible"),
+    [
+        # Workspace USE alone reads nothing.
+        ([], False),
+        # Without a scorer grant, the experiment's read decides.
+        ([("experiment", "1", READ.name)], True),
+        ([("experiment", "1", EDIT.name)], True),
+        # A scorer grant decides over the experiment, either way.
+        ([("experiment", "1", EDIT.name), ("scorer", "1/s1", DENY.name)], False),
+        ([("scorer", "1/s1", READ.name)], True),
+        # An experiment DENY hides its scorers even with a scorer grant.
+        ([("experiment", "1", DENY.name), ("scorer", "1/s1", READ.name)], False),
+    ],
+)
+def test_scorer_list_and_get_agree(workspace_permission_setup, grants, visible):
+    store = workspace_permission_setup["store"]
+    username = workspace_permission_setup["username"]
+    _set_workspace_permission(store, username, USE.name)
+    if grants:
+        _grant(store, username, "team-a", grants)
+
+    rows = [{"experiment_id": 1, "scorer_name": "s1"}]
+    assert _run_scorer_list_filter(rows) == (["s1"] if visible else [])
+    assert _run_scorer_point_route("validate_can_read_scorer", "1", "s1") is visible
+
+
 # ==========================================================================================
 # Trace assessment redaction
 # ==========================================================================================

@@ -154,6 +154,11 @@ disables the specific-resource scope, so the pickers cannot compose a grant
 the server would reject.
 :::
 
+A scorer is not a tier: it takes per-id grants on `<experiment_id>/<name>`.
+Reading one falls back the same way, though. A scorer grant decides, and
+without one the experiment's `READ` does. A `DENY` on the experiment hides its
+scorers.
+
 Editing a run in experiment 42, to show how the two combine. The first five rows have
 an explicit grant on the experiment, so the container check is settled whatever
 `default_permission` is. They assume that default is `READ` or `NO_PERMISSIONS`: a
